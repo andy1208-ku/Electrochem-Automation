@@ -17,6 +17,13 @@ import math
 import collections
 import warnings
 
+# --- Matplotlib and Pandas imports for plotting ---
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
 # Import the local tecancavro library
 try:
     from tecancavro import XCaliburD, TecanAPISerial
@@ -272,8 +279,6 @@ class SerialMeasurementRunner:
         Parses a MethodSCRIPT data package line (e.g., 'Pab...') using the
         integrated mscript parsing logic.
         """
-        # The line from the serial reader is stripped of newline, add it back
-        # for the parser function which expects it.
         package = parse_mscript_data_package(line + '\n')
         
         if not package:
@@ -281,24 +286,15 @@ class SerialMeasurementRunner:
 
         try:
             data_point = {}
-            # A data package can contain multiple variables.
-            # We iterate through them to find potential and current.
             for var in package:
-                # Potential can be 'ab' (WE vs RE) or 'da' (Applied)
                 if var.id in ['ab', 'da']:
-                    # MScriptVar.value is in base SI unit (V)
                     data_point['potential'] = var.value
-                # Current is 'ba' (WE current)
                 elif var.id == 'ba':
-                    # MScriptVar.value is in base SI unit (A).
-                    # The CSV writer expects microAmps (µA).
                     data_point['current'] = var.value * 1e6
             
-            # Only add the data point if we found both values.
             if 'potential' in data_point and 'current' in data_point:
                 self.data_points.append(data_point)
         except Exception as e:
-            # Add logging to avoid silent failures if parsing goes wrong.
             self.log(f"Error parsing data package: {line} -> {e}")
 
     def save_data_to_csv(self):
@@ -326,25 +322,27 @@ class SerialMeasurementRunner:
         self.log("=" * 60)
         self.log(f"Starting measurement for: {self.script_path.name}")
         self.log("=" * 60)
+        csv_path = None
         try:
             with open(self.script_path, 'r') as f: script = f.read()
         except Exception as e:
             self.log(f"ERROR: Failed to read script: {e}")
-            return False
+            return False, None
         
         if not self.connect():
             self.log("ERROR: Failed to connect to device")
-            return False
+            return False, None
         
         success = False
         try:
             if self.run_script(script):
-                if self.data_points: self.save_data_to_csv()
+                if self.data_points:
+                    csv_path = self.save_data_to_csv()
                 self.log(f"Total data points: {len(self.data_points)}")
                 success = True
         finally:
             self.disconnect()
-        return success
+        return success, csv_path
 
 
 class ElectrochemGUI:
@@ -389,27 +387,29 @@ class ElectrochemGUI:
         self.script_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.script_frame, text="Script Preview")
         self.setup_script_tab()
+        
+        # --- NEW: Add the plotter tab ---
+        self.plotter_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.plotter_frame, text="Plotter")
+        self.setup_plotter_tab()
 
     def create_cv_methodscript(self):
         """Create MethodSCRIPT for CV with correct SI unit formatting"""
-        # Get parameters and convert to SI string format
         begin = to_si_string(self.cv_params['begin_potential'].get(), 'V')
         v1 = to_si_string(self.cv_params['vertex1'].get(), 'V')
         v2 = to_si_string(self.cv_params['vertex2'].get(), 'V')
         step = to_si_string(self.cv_params['step_potential'].get(), 'V')
-        # --- THIS IS THE FIX ---
         scan_rate = to_si_string(self.cv_params['scan_rate'].get(), 'V/s')
-        # --- END FIX ---
         n_scans = self.cv_params['n_scans'].get()
         cond_pot = to_si_string(self.cv_params['cond_potential'].get(), 'V')
-        cond_time = self.cv_params['cond_time'].get() # Time is just a value in seconds
+        cond_time = self.cv_params['cond_time'].get()
 
         script_parts = [
             "e", "var c", "var p", "set_pgstat_mode 2", "set_max_bandwidth 40",
             "set_range ba 100u", "set_autoranging ba 1n 100u"
         ]
         
-        if float(self.cv_params['cond_time'].get()) > 0:
+        if float(cond_time) > 0:
             script_parts.extend([
                 f"set_e {cond_pot}", "cell_on",
                 f"# Condition for {cond_time}s",
@@ -468,8 +468,6 @@ class ElectrochemGUI:
         ])
 
         return "\n".join(script_parts)
-
-    # --- Other GUI methods remain unchanged. Below is a condensed version. ---
     
     def setup_method_tab(self):
         left_frame = ttk.Frame(self.method_frame)
@@ -497,7 +495,7 @@ class ElectrochemGUI:
         self.clear_params_frame()
         self.current_technique = "CV"
         self.cv_params = {}
-        params = [("Begin Potential (V):", "begin_potential", "0"), ("Vertex 1 (V):", "vertex1", "-0.5"), ("Vertex 2 (V):", "vertex2", "0.5"), ("Step Potential (V):", "step_potential", "0.01"), ("Scan Rate (V/s):", "scan_rate", "0.1"), ("Number of Scans:", "n_scans", "1"), ("Conditioning Potential (V):", "cond_potential", "0"), ("Conditioning Time (s):", "cond_time", "0")]
+        params = [("Begin Potential (V):", "begin_potential", "0"), ("Vertex 1 (V):", "vertex1", "-0.5"), ("Vertex 2 (V):", "vertex2", "0.5"), ("Step Potential (V):", "step_potential", "0.002"), ("Scan Rate (V/s):", "scan_rate", "0.1"), ("Number of Scans:", "n_scans", "1"), ("Conditioning Potential (V):", "cond_potential", "0"), ("Conditioning Time (s):", "cond_time", "0")]
         for i, (label, key, default) in enumerate(params):
             ttk.Label(self.params_frame, text=label).grid(row=i, column=0, sticky='w', pady=2)
             entry = ttk.Entry(self.params_frame, width=15); entry.insert(0, default); entry.grid(row=i, column=1, pady=2)
@@ -510,7 +508,7 @@ class ElectrochemGUI:
         self.clear_params_frame()
         self.current_technique = "SWV"
         self.swv_params = {}
-        params = [("Begin Potential (V):", "begin_potential", "-0.5"), ("End Potential (V):", "end_potential", "0.5"), ("Step Potential (V):", "step_potential", "0.01"), ("Amplitude (V):", "amplitude", "0.02"), ("Frequency (Hz):", "frequency", "15"), ("Conditioning Potential (V):", "cond_potential", "0"), ("Conditioning Time (s):", "cond_time", "0")]
+        params = [("Begin Potential (V):", "begin_potential", "-0.5"), ("End Potential (V):", "end_potential", "0.5"), ("Step Potential (V):", "step_potential", "0.002"), ("Amplitude (V):", "amplitude", "0.02"), ("Frequency (Hz):", "frequency", "15"), ("Conditioning Potential (V):", "cond_potential", "0"), ("Conditioning Time (s):", "cond_time", "0")]
         for i, (label, key, default) in enumerate(params):
             ttk.Label(self.params_frame, text=label).grid(row=i, column=0, sticky='w', pady=2)
             entry = ttk.Entry(self.params_frame, width=15); entry.insert(0, default); entry.grid(row=i, column=1, pady=2)
@@ -520,7 +518,6 @@ class ElectrochemGUI:
         ttk.Button(button_frame, text="Add to Queue", command=self.add_swv_to_queue).pack(side='left', padx=5)
         
     def setup_pump_tab(self):
-        # This function is unchanged
         pass
 
     def setup_queue_tab(self):
@@ -552,7 +549,62 @@ class ElectrochemGUI:
     def setup_script_tab(self):
         text_frame = ttk.Frame(self.script_frame); text_frame.pack(fill='both', expand=True, padx=10, pady=5)
         self.script_text = tk.Text(text_frame, wrap='none', font=('Courier', 11)); self.script_text.pack(fill='both', expand=True)
+    
+    def setup_plotter_tab(self):
+        """Sets up the new tab for plotting data."""
+        plot_controls = ttk.Frame(self.plotter_frame)
+        plot_controls.pack(side='top', fill='x', pady=5, padx=5)
         
+        ttk.Button(plot_controls, text="Load and Plot CSV", command=self.load_and_plot_csv).pack(side='left')
+
+        # Create a Matplotlib figure and axis
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title('Voltammogram')
+        self.ax.set_xlabel('Potential (V)')
+        self.ax.set_ylabel('Current (µA)')
+        self.ax.grid(True)
+
+        # Create a canvas to embed the plot in Tkinter
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plotter_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+
+    def load_and_plot_csv(self):
+        """Opens a file dialog to select a CSV and plots it."""
+        filepath = filedialog.askopenfilename(
+            title="Select a measurement CSV",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*"))
+        )
+        if filepath:
+            self.plot_data(filepath)
+
+    def plot_data(self, csv_path):
+        """Reads a CSV file and plots the voltammogram."""
+        try:
+            df = pd.read_csv(csv_path)
+            potential_col = 'Potential (V)'
+            current_col = 'Current (µA)'
+
+            if potential_col in df.columns and current_col in df.columns:
+                self.ax.clear()  # Clear the previous plot
+                self.ax.plot(df[potential_col], df[current_col])
+                
+                # Apply styling from the user's example
+                self.ax.set_title('Voltammogram')
+                self.ax.set_xlabel('Potential (V)')
+                self.ax.set_ylabel('Current (µA)')
+                self.ax.grid(visible=True, which='major', linestyle='-')
+                self.ax.grid(visible=True, which='minor', linestyle='--', alpha=0.2)
+                self.ax.minorticks_on()
+                
+                self.canvas.draw() # Redraw the canvas
+                self.notebook.select(self.plotter_frame) # Switch to the plot tab
+            else:
+                messagebox.showerror("Plot Error", "CSV file must contain 'Potential (V)' and 'Current (µA)' columns.")
+        except Exception as e:
+            messagebox.showerror("Plot Error", f"Failed to plot data: {e}")
+
     def clear_params_frame(self):
         for widget in self.params_frame.winfo_children(): widget.destroy()
 
@@ -619,17 +671,25 @@ class ElectrochemGUI:
             self.measurement_queue[i]['status'] = 'running'
             self.root.after(0, self.refresh_queue_display)
             self.root.after(0, self.update_status, f"Running: {item['type']} - {item.get('details', '')}")
+            csv_path = None
             try:
                 if item['type'].startswith('PUMP_'): self.execute_pump_action(item)
                 else:
                     self.current_runner = SerialMeasurementRunner(Path(item['script_path']), log_callback=self.log_message)
-                    self.measurement_queue[i]['status'] = 'completed' if self.current_runner.execute() else 'failed'
+                    success, csv_path = self.current_runner.execute()
+                    self.measurement_queue[i]['status'] = 'completed' if success else 'failed'
                     self.current_runner = None
             except Exception as e:
                 self.measurement_queue[i]['status'] = 'failed'
                 self.log_message(f"CRITICAL ERROR in queue execution: {e}")
+            
+            # If the measurement was successful and created a file, plot it
+            if csv_path:
+                self.root.after(0, self.plot_data, csv_path)
+
             self.root.after(0, self.refresh_queue_display)
             time.sleep(1)
+
         self.is_running = False
         self.root.after(0, self.update_status, "Queue Complete")
     
@@ -649,7 +709,6 @@ class ElectrochemGUI:
         self.status_label.config(text=f"Status: {message}")
 
     def execute_pump_action(self, item):
-        # This function is unchanged
         pass
 
 
